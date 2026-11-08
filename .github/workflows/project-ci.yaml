@@ -9,7 +9,7 @@
 #
 #   jobs:
 #     test:
-#       uses: jaimemachadoneto/devbase-stacks/.github/workflows/project-ci.yaml@v0.1.0
+#       uses: jaimemachadoneto/devbase-stacks/.github/workflows/project-ci.yaml@v0.2.0
 name: project-ci
 
 on:
