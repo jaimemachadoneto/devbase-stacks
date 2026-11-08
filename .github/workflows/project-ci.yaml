@@ -9,7 +9,7 @@
 #
 #   jobs:
 #     test:
-#       uses: jaimemachadoneto/devbase-stacks/.github/workflows/project-ci.yaml@v0.2.0
+#       uses: jaimemachadoneto/devbase-stacks/.github/workflows/project-ci.yaml@v0.3.0
 name: project-ci
 
 on:
@@ -35,14 +35,20 @@ jobs:
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
-      - name: Install the project dependencies
-        if: inputs.setup != ''
-        run: devenv shell -- bash -c "${{ inputs.setup }}"
-
-      # `devenv test` runs the stack's setup, then `check`, the same suite as
-      # on a laptop. A missing test runner is a failure.
-      - name: check
-        run: devenv test
-
-      - name: lint
-        run: devenv shell -- lint
+      # One shell runs setup, then check, then lint, so all three see the same
+      # project venv. A separate `devenv test` step uses a different venv, and
+      # lint then fails on imports that setup installed.
+      - name: setup, check and lint
+        env:
+          # A string, not an expression inside the script: a quote in it must
+          # not change the command.
+          EXTRA_SETUP: ${{ inputs.setup }}
+        run: |
+          set -eu
+          devenv shell -- bash -s <<'SCRIPT'
+          set -eu
+          setup
+          if [ -n "${EXTRA_SETUP:-}" ]; then bash -c "$EXTRA_SETUP"; fi
+          check
+          lint
+          SCRIPT

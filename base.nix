@@ -133,7 +133,12 @@ in
 
     # Language modules append to base.commands, so a project mixing Go and Node
     # gets both languages' work from one `check`.
-    scripts = lib.mapAttrs mkTask cfg.commands;
+    scripts = lib.mapAttrs mkTask cfg.commands // {
+      # CI runs `setup`, then `check` and `lint` in the same shell. The venv of
+      # `devenv test` differs from the venv of `devenv shell`, so one setup
+      # cannot serve both.
+      setup = mkTask "setup" cfg.testSetup;
+    };
 
     # `devenv test` is what CI runs: the same setup and the same suite.
     enterTest = lib.mkIf (cfg.commands.check != [ ]) ''
