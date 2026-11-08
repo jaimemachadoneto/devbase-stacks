@@ -1,0 +1,212 @@
+# Reusable workflow: build, scan and test a container image, and on a release
+# publish it and open the PR that deploys it.
+#
+# On a pull request (release: false) it builds the image for linux/amd64,
+# scans it with Trivy and runs the smoke command. Nothing is pushed.
+#
+# On a vX.Y.Z tag (release: true) it does the same, then pushes the image for
+# every platform, tagged X.Y.Z and sha-<commit>, with an SBOM and provenance.
+# Then it opens a PR in the GitOps repository that sets the new sha-<commit>
+# tag in the app's HelmRelease. Flux applies it after the merge.
+#
+# The tag in the GitOps repository is the immutable sha-<commit>, which is
+# what home-ops pins today. The image is found by its `repository` value, so
+# any controller name works.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: The image without a tag, for example ghcr.io/jaimemachadoneto/bank-report.
+        type: string
+        required: true
+      context:
+        description: The docker build context.
+        type: string
+        default: "."
+      dockerfile:
+        description: The Dockerfile, relative to the repository root.
+        type: string
+        default: Dockerfile
+      platforms:
+        description: The platforms of a release. Validation builds linux/amd64 only.
+        type: string
+        default: linux/amd64,linux/arm64
+      smoke-command:
+        description: Arguments for `docker run --rm <image>` that must exit 0, for example "--version". Empty skips the smoke test.
+        type: string
+        default: ""
+      release:
+        description: Push the image and open the deploy PR. Set it to true only on a vX.Y.Z tag.
+        type: boolean
+        default: false
+      gitops-repo:
+        description: The GitOps repository that Flux applies.
+        type: string
+        default: jaimemachadoneto/home-ops
+      gitops-file:
+        description: The HelmRelease that holds the image, relative to the GitOps repository root.
+        type: string
+        default: ""
+    secrets:
+      gitops-token:
+        description: A token that can push a branch to the GitOps repository and open a PR there.
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: A release needs a version tag and a GitOps target
+        if: inputs.release
+        env:
+          GITOPS_FILE: ${{ inputs.gitops-file }}
+          HAS_TOKEN: ${{ secrets.gitops-token != '' }}
+        run: |
+          set -eu
+          case "$GITHUB_REF" in refs/tags/v[0-9]*) ;; *)
+            echo "::error::release: true needs a vX.Y.Z tag, not $GITHUB_REF"; exit 1 ;;
+          esac
+          [ -n "$GITOPS_FILE" ] || { echo "::error::release: true needs the gitops-file input"; exit 1; }
+          [ "$HAS_TOKEN" = true ] || { echo "::error::release: true needs the gitops-token secret"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: inputs.release
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ inputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+
+      # One platform, loaded into the local daemon, so Trivy and the smoke
+      # test examine the image before anything is published.
+      - name: Build for the scan
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          tags: local/ci:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/ci:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Smoke test
+        if: inputs.smoke-command != ''
+        env:
+          SMOKE: ${{ inputs.smoke-command }}
+        run: |
+          set -eu
+          read -ra args <<<"$SMOKE"
+          docker run --rm local/ci:scan "${args[@]}"
+
+      # The registry is the first part of the image name: ghcr.io, or
+      # registry.gitlab.com. GITHUB_TOKEN can push only to ghcr.io.
+      - name: Registry
+        if: inputs.release
+        id: registry
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: echo "host=${IMAGE%%/*}" >>"$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        if: inputs.release
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish
+        if: inputs.release
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+
+  gitops:
+    needs: image
+    if: inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE: ${{ inputs.image }}
+      TAG: sha-${{ github.sha }}
+      VERSION: ${{ needs.image.outputs.version }}
+      FILE: ${{ inputs.gitops-file }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          token: ${{ secrets.gitops-token }}
+          path: gitops
+
+      # yq and patch are on the ubuntu runner image. Every mapping whose
+      # `repository` is this image gets the new tag, whatever the controller
+      # is called. yq drops blank lines when it writes, so only its non-blank
+      # changes go back into the file: the PR shows one changed line.
+      # tests/run.sh runs the block between the markers.
+      - name: Set the image tag
+        working-directory: gitops
+        run: |
+          set -eu
+          # begin set-image-tag
+          [ -f "$FILE" ] || { echo "::error::$FILE is not in the GitOps repository"; exit 1; }
+          yq '(.. | select(tag == "!!map" and has("repository") and .repository == env(IMAGE))).tag = env(TAG)' "$FILE" >"$RUNNER_TEMP/new.yaml"
+          diff -U0 -B "$FILE" "$RUNNER_TEMP/new.yaml" >"$RUNNER_TEMP/tag.patch" || true
+          if [ -s "$RUNNER_TEMP/tag.patch" ]; then
+            patch -s "$FILE" "$RUNNER_TEMP/tag.patch"
+          elif ! grep -q "tag: $TAG" "$FILE"; then
+            echo "::error::no image with repository $IMAGE in $FILE"
+            exit 1
+          fi
+          # end set-image-tag
+          git --no-pager diff
+
+      - name: Open the deploy PR
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          path: gitops
+          token: ${{ secrets.gitops-token }}
+          branch: deploy/${{ github.event.repository.name }}-${{ needs.image.outputs.version }}
+          delete-branch: true
+          commit-message: deploy ${{ github.event.repository.name }} ${{ needs.image.outputs.version }} (${{ env.TAG }})
+          title: deploy ${{ github.event.repository.name }} ${{ needs.image.outputs.version }} (${{ env.TAG }})
+          body: |
+            Set `${{ inputs.image }}` to `${{ env.TAG }}` in `${{ inputs.gitops-file }}`.
+
+            - Source: ${{ github.server_url }}/${{ github.repository }}/tree/v${{ needs.image.outputs.version }}
+            - Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Opened by the devbase `image` workflow. Flux applies it after the merge.

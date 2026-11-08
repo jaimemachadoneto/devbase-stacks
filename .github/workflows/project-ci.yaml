@@ -1,0 +1,48 @@
+# Reusable workflow: the test suite of one project, in its own devenv shell.
+#
+# A project pins the public stacks repository as a devenv input and commits
+# devenv.yaml, devenv.stacks.nix and devenv.lock. This workflow therefore needs
+# no checkout of the private devbase repository and no token. It reads the
+# project, installs Nix and devenv, and runs the same verbs as a laptop.
+#
+# Call it from a project:
+#
+#   jobs:
+#     test:
+#       uses: jaimemachadoneto/devbase-stacks/.github/workflows/project-ci.yaml@v0.1.0
+name: project-ci
+
+on:
+  workflow_call:
+    inputs:
+      setup:
+        description: An extra setup command for the project, such as "pnpm install --frozen-lockfile". The stack already installs its own dependencies.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Install devenv
+        run: nix profile install nixpkgs#devenv
+
+      - name: Install the project dependencies
+        if: inputs.setup != ''
+        run: devenv shell -- bash -c "${{ inputs.setup }}"
+
+      # `devenv test` runs the stack's setup, then `check`, the same suite as
+      # on a laptop. A missing test runner is a failure.
+      - name: check
+        run: devenv test
+
+      - name: lint
+        run: devenv shell -- lint
